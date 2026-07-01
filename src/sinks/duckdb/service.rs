@@ -3,6 +3,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use futures::future::BoxFuture;
@@ -17,7 +18,7 @@ use vector_lib::{
 };
 
 use crate::{
-    internal_events::EndpointBytesSent,
+    internal_events::{DuckdbRequestProcessed, EndpointBytesSent},
     sinks::prelude::{RequestMetadataBuilder, RetryLogic},
 };
 
@@ -136,6 +137,15 @@ pub struct DuckdbResponse {
     metadata: RequestMetadata,
 }
 
+struct DuckdbWriteTimings {
+    lock_wait_duration: Duration,
+    transaction_begin_duration: Duration,
+    appender_create_duration: Duration,
+    append_duration: Duration,
+    flush_duration: Duration,
+    commit_duration: Duration,
+}
+
 impl DriverResponse for DuckdbResponse {
     fn event_status(&self) -> EventStatus {
         EventStatus::Delivered
@@ -167,34 +177,79 @@ impl Service<DuckdbRequest> for DuckdbService {
         let serializer = self.serializer.clone();
 
         let future = async move {
+            let total_started = Instant::now();
+            let rows = request.events.len();
             let metadata = request.metadata;
+
+            let encode_started = Instant::now();
             let record_batch = serializer
                 .encode_to_record_batch(&request.events)
                 .context(ArrowEncodingSnafu)?;
+            let encode_duration = encode_started.elapsed();
 
-            tokio::task::spawn_blocking(move || {
+            let write_timings = tokio::task::spawn_blocking(move || {
+                let lock_started = Instant::now();
                 let mut conn = connection
                     .lock()
                     .map_err(|_| DuckdbServiceError::MutexPoisoned)?;
+                let lock_wait_duration = lock_started.elapsed();
+
+                let transaction_begin_started = Instant::now();
                 let tx = conn
                     .transaction()
                     .map_err(|source| DuckdbServiceError::DuckDb { source })?;
-                {
+                let transaction_begin_duration = transaction_begin_started.elapsed();
+
+                let (appender_create_duration, append_duration, flush_duration) = {
+                    let appender_create_started = Instant::now();
                     let mut appender = tx
                         .appender_to_db(&table, &database)
                         .map_err(|source| DuckdbServiceError::DuckDb { source })?;
+                    let appender_create_duration = appender_create_started.elapsed();
+
+                    let append_started = Instant::now();
                     appender
                         .append_record_batch(record_batch)
                         .map_err(|source| DuckdbServiceError::DuckDb { source })?;
+                    let append_duration = append_started.elapsed();
+
+                    let flush_started = Instant::now();
                     appender
                         .flush()
                         .map_err(|source| DuckdbServiceError::DuckDb { source })?;
-                }
+                    let flush_duration = flush_started.elapsed();
+
+                    (appender_create_duration, append_duration, flush_duration)
+                };
+
+                let commit_started = Instant::now();
                 tx.commit()
-                    .map_err(|source| DuckdbServiceError::DuckDb { source })
+                    .map_err(|source| DuckdbServiceError::DuckDb { source })?;
+                let commit_duration = commit_started.elapsed();
+
+                Ok(DuckdbWriteTimings {
+                    lock_wait_duration,
+                    transaction_begin_duration,
+                    appender_create_duration,
+                    append_duration,
+                    flush_duration,
+                    commit_duration,
+                })
             })
             .await
             .context(JoinSnafu)??;
+
+            emit!(DuckdbRequestProcessed {
+                rows,
+                encode_duration,
+                lock_wait_duration: write_timings.lock_wait_duration,
+                transaction_begin_duration: write_timings.transaction_begin_duration,
+                appender_create_duration: write_timings.appender_create_duration,
+                append_duration: write_timings.append_duration,
+                flush_duration: write_timings.flush_duration,
+                commit_duration: write_timings.commit_duration,
+                total_duration: total_started.elapsed(),
+            });
 
             emit!(EndpointBytesSent {
                 byte_size: metadata.request_encoded_size(),

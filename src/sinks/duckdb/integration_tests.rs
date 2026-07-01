@@ -1,8 +1,20 @@
-use std::{env, time::Instant};
+use std::{
+    env, fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use chrono::{TimeZone, Utc};
 use futures::{StreamExt, stream};
-use vector_lib::event::{BatchNotifier, BatchStatus, Event, LogEvent};
+use vector_lib::{
+    event::{BatchNotifier, BatchStatus, Event, LogEvent, MetricValue},
+    metrics::{Controller, init_test as init_metrics},
+};
 
 use crate::{
     config::{SinkConfig, SinkContext},
@@ -33,6 +45,71 @@ fn create_stress_event(id: i64) -> Event {
     );
     event.insert("value", id as f64 * 1.25);
     event.into()
+}
+
+fn duckdb_wal_path(path: &Path) -> std::path::PathBuf {
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push(".wal");
+    wal_path.into()
+}
+
+fn file_size(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn update_max(max: &AtomicU64, value: u64) {
+    let mut current = max.load(Ordering::Relaxed);
+    while value > current {
+        match max.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn print_duckdb_file_sizes(path: &Path) {
+    let wal_path = duckdb_wal_path(path);
+    println!(
+        "duckdb file sizes: db={} bytes, wal={} bytes",
+        file_size(path),
+        file_size(&wal_path)
+    );
+}
+
+fn print_duckdb_stage_metrics() {
+    let Ok(controller) = Controller::get() else {
+        return;
+    };
+
+    let mut stage_metrics = controller
+        .capture_metrics()
+        .into_iter()
+        .filter_map(|metric| {
+            if metric.name() != "duckdb_request_stage_duration_seconds" {
+                return None;
+            }
+
+            let stage = metric.tags()?.get("stage")?.to_string();
+            let MetricValue::AggregatedHistogram { count, sum, .. } = metric.value() else {
+                return None;
+            };
+
+            Some((stage, *count, *sum))
+        })
+        .collect::<Vec<_>>();
+
+    stage_metrics.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (stage, count, sum) in stage_metrics {
+        if count > 0 {
+            println!(
+                "duckdb stage {stage}: count={count}, total={sum:.6}s, avg={:.6}s",
+                sum / count as f64
+            );
+        }
+    }
 }
 
 fn prepare_config() -> (DuckdbConfig, String, String) {
@@ -310,6 +387,11 @@ async fn writes_events() {
 #[tokio::test]
 #[ignore]
 async fn stress_million_events() {
+    init_metrics();
+    if let Ok(controller) = Controller::get() {
+        controller.reset();
+    }
+
     let event_count = env::var("DUCKDB_STRESS_EVENTS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -337,11 +419,25 @@ async fn stress_million_events() {
     .expect("create stress table");
     drop(conn);
 
+    let request_concurrency = env::var("DUCKDB_STRESS_REQUEST_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let concurrent_reader = env::var("DUCKDB_STRESS_CONCURRENT_READER")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let reader_holds_transaction = env::var("DUCKDB_STRESS_READER_HOLDS_TRANSACTION")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let request_concurrency_config = request_concurrency
+        .map(|concurrency| format!("request.concurrency = {concurrency}\n"))
+        .unwrap_or_default();
+
     let config_str = format!(
         r#"
             endpoint = "{endpoint}"
             table = "{table}"
             batch.max_events = {batch_size}
+            {request_concurrency_config}
         "#,
     );
     let (config, _) = load_sink::<DuckdbConfig>(&config_str).unwrap();
@@ -356,8 +452,64 @@ async fn stress_million_events() {
         (0..event_count).map(|id| create_stress_event(id).with_batch_notifier(&batch)),
     );
 
+    let sampler_running = Arc::new(AtomicBool::new(true));
+    let max_db_size = Arc::new(AtomicU64::new(0));
+    let max_wal_size = Arc::new(AtomicU64::new(0));
+    let sampler = {
+        let path = path.clone();
+        let wal_path = duckdb_wal_path(&path);
+        let running = Arc::clone(&sampler_running);
+        let max_db_size = Arc::clone(&max_db_size);
+        let max_wal_size = Arc::clone(&max_wal_size);
+        thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                update_max(&max_db_size, file_size(&path));
+                update_max(&max_wal_size, file_size(&wal_path));
+                thread::sleep(Duration::from_millis(50));
+            }
+            update_max(&max_db_size, file_size(&path));
+            update_max(&max_wal_size, file_size(&wal_path));
+        })
+    };
+
+    let reader_running = Arc::new(AtomicBool::new(true));
+    let reader = concurrent_reader.then({
+        let path = path.clone();
+        let table = table.clone();
+        let running = Arc::clone(&reader_running);
+        move || {
+            thread::spawn(move || {
+                let conn = duckdb::Connection::open(path).expect("open concurrent reader");
+                let mut queries = 0_u64;
+                let mut errors = 0_u64;
+                if reader_holds_transaction {
+                    conn.execute("BEGIN TRANSACTION", [])
+                        .expect("begin reader transaction");
+                }
+                while running.load(Ordering::Relaxed) {
+                    match conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    }) {
+                        Ok(_) => queries += 1,
+                        Err(_) => errors += 1,
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if reader_holds_transaction {
+                    conn.execute("COMMIT", [])
+                        .expect("commit reader transaction");
+                }
+                (queries, errors)
+            })
+        }
+    });
+
     let started = Instant::now();
     sink.run(Box::pin(events.map(Into::into))).await.unwrap();
+    reader_running.store(false, Ordering::Relaxed);
+    let reader_result = reader.map(|reader| reader.join().expect("join concurrent reader"));
+    sampler_running.store(false, Ordering::Relaxed);
+    sampler.join().expect("join file size sampler");
     drop(batch);
     assert_eq!(receiver.await, BatchStatus::Delivered);
     let elapsed = started.elapsed();
@@ -390,9 +542,22 @@ async fn stress_million_events() {
 
     let events_per_second = event_count as f64 / elapsed.as_secs_f64();
     println!(
-        "inserted {event_count} events in {:.3}s ({events_per_second:.0} events/s), batch.max_events={batch_size}",
-        elapsed.as_secs_f64()
+        "inserted {event_count} events in {:.3}s ({events_per_second:.0} events/s), batch.max_events={batch_size}, request.concurrency={}, concurrent_reader={concurrent_reader}, reader_holds_transaction={reader_holds_transaction}",
+        elapsed.as_secs_f64(),
+        request_concurrency
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string())
     );
+    if let Some((queries, errors)) = reader_result {
+        println!("concurrent reader: queries={queries}, errors={errors}");
+    }
+    print_duckdb_file_sizes(&path);
+    println!(
+        "duckdb max sampled file sizes: db={} bytes, wal={} bytes",
+        max_db_size.load(Ordering::Relaxed),
+        max_wal_size.load(Ordering::Relaxed)
+    );
+    print_duckdb_stage_metrics();
 }
 
 #[tokio::test]
