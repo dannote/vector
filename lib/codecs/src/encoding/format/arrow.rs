@@ -4,10 +4,17 @@
 //! This implements the streaming variant of the Arrow IPC protocol, which writes
 //! a continuous stream of record batches without a file footer.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use arrow::{
-    datatypes::{DataType, Field, Fields, Schema, SchemaRef},
+    array::{
+        ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, PrimitiveBuilder,
+        StringBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder,
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    },
+    datatypes::{ArrowPrimitiveType, DataType, Field, Fields, Schema, SchemaRef, TimeUnit},
     error::ArrowError,
     ipc::writer::StreamWriter,
     json::reader::ReaderBuilder,
@@ -15,10 +22,11 @@ use arrow::{
 };
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+use chrono::Timelike;
 use snafu::{ResultExt, Snafu, ensure};
 use vector_common::{histogram, internal_event::HistogramName};
 use vector_config::configurable_component;
-use vector_core::event::Event;
+use vector_core::event::{Event, Value};
 
 /// Provides Arrow schema for encoding.
 ///
@@ -102,6 +110,11 @@ impl ArrowStreamSerializer {
         events: &[Event],
     ) -> Result<RecordBatch, ArrowEncodingError> {
         let started = Instant::now();
+        if let Some(record_batch) = build_direct_record_batch(self.schema.clone(), events)? {
+            record_arrow_record_batch_stage("total", started);
+            return Ok(record_batch);
+        }
+
         let json_started = Instant::now();
         let values = vector_log_events_to_json_values(events).map_err(|e| {
             ArrowEncodingError::RecordBatchCreation {
@@ -335,6 +348,286 @@ pub(crate) fn vector_log_events_to_json_values(
         .filter_map(Event::maybe_as_log)
         .map(serde_json::to_value)
         .collect()
+}
+
+fn build_direct_record_batch(
+    schema: SchemaRef,
+    events: &[Event],
+) -> Result<Option<RecordBatch>, ArrowEncodingError> {
+    if !schema
+        .fields()
+        .iter()
+        .all(|field| is_directly_encodable_type(field.as_ref()))
+    {
+        return Ok(None);
+    }
+
+    let direct_started = Instant::now();
+    let log_events = events
+        .iter()
+        .filter_map(Event::maybe_as_log)
+        .collect::<Vec<_>>();
+    if log_events.is_empty() {
+        return Err(ArrowEncodingError::NoEvents);
+    }
+
+    let mut arrays = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let Some(array) = build_direct_array(field, &log_events)? else {
+            return Ok(None);
+        };
+        arrays.push(array);
+    }
+    let record_batch = RecordBatch::try_new(schema, arrays).context(RecordBatchCreationSnafu)?;
+    record_arrow_record_batch_stage("direct_build", direct_started);
+    Ok(Some(record_batch))
+}
+
+fn is_directly_encodable_type(field: &Field) -> bool {
+    matches!(
+        field.data_type(),
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::Date32
+            | DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
+            | DataType::Timestamp(
+                TimeUnit::Second
+                    | TimeUnit::Millisecond
+                    | TimeUnit::Microsecond
+                    | TimeUnit::Nanosecond,
+                None,
+            )
+            | DataType::Decimal128(_, _)
+    )
+}
+
+fn build_direct_array(
+    field: &Field,
+    log_events: &[&vector_core::event::LogEvent],
+) -> Result<Option<ArrayRef>, ArrowEncodingError> {
+    macro_rules! primitive_array {
+        ($builder:ty, $convert:expr) => {{
+            let mut builder = <$builder>::with_capacity(log_events.len());
+            for log in log_events {
+                match log
+                    .as_map()
+                    .and_then(|fields| fields.get(field.name().as_str()))
+                {
+                    Some(Value::Null) | None => append_null_or_error(&mut builder, field)?,
+                    Some(value) => match $convert(value) {
+                        Some(value) => builder.append_value(value),
+                        None => return Ok(None),
+                    },
+                }
+            }
+            Ok(Some(Arc::new(builder.finish()) as ArrayRef))
+        }};
+    }
+
+    match field.data_type() {
+        DataType::Boolean => primitive_array!(BooleanBuilder, |value: &Value| match value {
+            Value::Boolean(value) => Some(*value),
+            _ => None,
+        }),
+        DataType::Int8 => primitive_array!(Int8Builder, |value: &Value| integer_value(value)
+            .and_then(|value| value.try_into().ok())),
+        DataType::Int16 => primitive_array!(Int16Builder, |value: &Value| integer_value(value)
+            .and_then(|value| value.try_into().ok())),
+        DataType::Int32 => primitive_array!(Int32Builder, |value: &Value| integer_value(value)
+            .and_then(|value| value.try_into().ok())),
+        DataType::Int64 => primitive_array!(Int64Builder, integer_value),
+        DataType::UInt8 => primitive_array!(UInt8Builder, |value: &Value| integer_value(value)
+            .and_then(|value| value.try_into().ok())),
+        DataType::UInt16 => primitive_array!(UInt16Builder, |value: &Value| integer_value(value)
+            .and_then(|value| value.try_into().ok())),
+        DataType::UInt32 => primitive_array!(UInt32Builder, |value: &Value| integer_value(value)
+            .and_then(|value| value.try_into().ok())),
+        DataType::UInt64 => primitive_array!(UInt64Builder, |value: &Value| integer_value(value)
+            .and_then(|value| value.try_into().ok())),
+        DataType::Float32 => primitive_array!(Float32Builder, |value: &Value| float_value(value)
+            .map(|value| value as f32)),
+        DataType::Float64 => primitive_array!(Float64Builder, float_value),
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(log_events.len(), 1024);
+            for log in log_events {
+                match log
+                    .as_map()
+                    .and_then(|fields| fields.get(field.name().as_str()))
+                {
+                    Some(Value::Null) | None => append_null_or_error(&mut builder, field)?,
+                    Some(Value::Bytes(value)) => {
+                        builder.append_value(String::from_utf8_lossy(value))
+                    }
+                    Some(Value::Regex(value)) => builder.append_value(value.as_str()),
+                    Some(_) => return Ok(None),
+                }
+            }
+            Ok(Some(Arc::new(builder.finish()) as ArrayRef))
+        }
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::with_capacity(log_events.len(), 1024);
+            for log in log_events {
+                match log
+                    .as_map()
+                    .and_then(|fields| fields.get(field.name().as_str()))
+                {
+                    Some(Value::Null) | None => append_null_or_error(&mut builder, field)?,
+                    Some(Value::Bytes(value)) => builder.append_value(value),
+                    Some(Value::Regex(value)) => builder.append_value(value.as_bytes()),
+                    Some(_) => return Ok(None),
+                }
+            }
+            Ok(Some(Arc::new(builder.finish()) as ArrayRef))
+        }
+        DataType::Date32 => primitive_array!(Date32Builder, |value: &Value| match value {
+            Value::Timestamp(value) => Some((value.timestamp() / 86_400) as i32),
+            _ => None,
+        }),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            primitive_array!(Time64MicrosecondBuilder, timestamp_time_micros)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            primitive_array!(Time64NanosecondBuilder, |value: &Value| {
+                timestamp_time_micros(value).map(|value| value * 1_000)
+            })
+        }
+        DataType::Timestamp(TimeUnit::Second, None) => {
+            primitive_array!(TimestampSecondBuilder, |value: &Value| match value {
+                Value::Timestamp(value) => Some(value.timestamp()),
+                _ => None,
+            })
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            primitive_array!(TimestampMillisecondBuilder, |value: &Value| match value {
+                Value::Timestamp(value) => Some(value.timestamp_millis()),
+                _ => None,
+            })
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            primitive_array!(TimestampMicrosecondBuilder, |value: &Value| match value {
+                Value::Timestamp(value) => Some(value.timestamp_micros()),
+                _ => None,
+            })
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            primitive_array!(TimestampNanosecondBuilder, |value: &Value| match value {
+                Value::Timestamp(value) => value.timestamp_nanos_opt(),
+                _ => None,
+            })
+        }
+        DataType::Decimal128(precision, scale) => {
+            let mut builder = Decimal128Builder::with_capacity(log_events.len())
+                .with_precision_and_scale(*precision, *scale)
+                .context(RecordBatchCreationSnafu)?;
+            let multiplier = 10_i128.pow((*scale).try_into().unwrap_or(0));
+            for log in log_events {
+                match log
+                    .as_map()
+                    .and_then(|fields| fields.get(field.name().as_str()))
+                {
+                    Some(Value::Null) | None => append_null_or_error(&mut builder, field)?,
+                    Some(value) => match decimal_value(value, multiplier) {
+                        Some(value) => builder.append_value(value),
+                        None => return Ok(None),
+                    },
+                }
+            }
+            Ok(Some(Arc::new(builder.finish()) as ArrayRef))
+        }
+        _ => unreachable!("unsupported direct Arrow data type"),
+    }
+}
+
+trait DirectAppendNull {
+    fn append_null_direct(&mut self);
+}
+
+impl<T: ArrowPrimitiveType> DirectAppendNull for PrimitiveBuilder<T> {
+    fn append_null_direct(&mut self) {
+        self.append_null();
+    }
+}
+
+impl DirectAppendNull for BooleanBuilder {
+    fn append_null_direct(&mut self) {
+        self.append_null();
+    }
+}
+
+impl DirectAppendNull for StringBuilder {
+    fn append_null_direct(&mut self) {
+        self.append_null();
+    }
+}
+
+impl DirectAppendNull for BinaryBuilder {
+    fn append_null_direct(&mut self) {
+        self.append_null();
+    }
+}
+
+fn append_null_or_error<T: DirectAppendNull>(
+    builder: &mut T,
+    field: &Field,
+) -> Result<(), ArrowEncodingError> {
+    if field.is_nullable() {
+        builder.append_null_direct();
+        Ok(())
+    } else {
+        let error: vector_common::Error = Box::new(ArrowEncodingError::NullConstraint {
+            field_name: field.name().clone(),
+        });
+        vector_common::internal_event::emit(crate::internal_events::EncoderNullConstraintError {
+            error: &error,
+        });
+        Err(ArrowEncodingError::NullConstraint {
+            field_name: field.name().clone(),
+        })
+    }
+}
+
+fn integer_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn float_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(value) => Some(value.into_inner()),
+        Value::Integer(value) => Some(*value as f64),
+        _ => None,
+    }
+}
+
+fn timestamp_time_micros(value: &Value) -> Option<i64> {
+    match value {
+        Value::Timestamp(value) => Some(
+            i64::from(value.time().num_seconds_from_midnight()) * 1_000_000
+                + i64::from(value.timestamp_subsec_micros()),
+        ),
+        _ => None,
+    }
+}
+
+fn decimal_value(value: &Value, multiplier: i128) -> Option<i128> {
+    match value {
+        Value::Integer(value) => Some(i128::from(*value) * multiplier),
+        Value::Float(value) => Some((value.into_inner() * multiplier as f64).round() as i128),
+        _ => None,
+    }
 }
 
 /// Build an Arrow RecordBatch from a slice of events using the provided schema.
