@@ -132,6 +132,7 @@ pub enum HistogramName {
     SourceBufferUtilization,
     TransformBufferUtilization,
     DuckdbRequestStageDurationSeconds,
+    ArrowRecordBatchStageDurationSeconds,
 }
 
 impl HistogramName {
@@ -168,6 +169,9 @@ impl HistogramName {
             Self::SourceBufferUtilization => "source_buffer_utilization",
             Self::TransformBufferUtilization => "transform_buffer_utilization",
             Self::DuckdbRequestStageDurationSeconds => "duckdb_request_stage_duration_seconds",
+            Self::ArrowRecordBatchStageDurationSeconds => {
+                "arrow_record_batch_stage_duration_seconds"
+            }
         }
     }
 }

@@ -4,6 +4,8 @@
 //! This implements the streaming variant of the Arrow IPC protocol, which writes
 //! a continuous stream of record batches without a file footer.
 
+use std::time::Instant;
+
 use arrow::{
     datatypes::{DataType, Field, Fields, Schema, SchemaRef},
     error::ArrowError,
@@ -14,6 +16,7 @@ use arrow::{
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use snafu::{ResultExt, Snafu, ensure};
+use vector_common::{histogram, internal_event::HistogramName};
 use vector_config::configurable_component;
 use vector_core::event::Event;
 
@@ -98,12 +101,18 @@ impl ArrowStreamSerializer {
         &self,
         events: &[Event],
     ) -> Result<RecordBatch, ArrowEncodingError> {
+        let started = Instant::now();
+        let json_started = Instant::now();
         let values = vector_log_events_to_json_values(events).map_err(|e| {
             ArrowEncodingError::RecordBatchCreation {
                 source: arrow::error::ArrowError::JsonError(e.to_string()),
             }
         })?;
-        build_record_batch(self.schema.clone(), &values)
+        record_arrow_record_batch_stage("event_to_json", json_started);
+
+        let record_batch = build_record_batch(self.schema.clone(), &values)?;
+        record_arrow_record_batch_stage("total", started);
+        Ok(record_batch)
     }
 
     /// Create a new ArrowStreamSerializer with the given configuration
@@ -208,6 +217,11 @@ pub enum ArrowEncodingError {
     },
 }
 
+fn record_arrow_record_batch_stage(stage: &'static str, started: Instant) {
+    histogram!(HistogramName::ArrowRecordBatchStageDurationSeconds, "stage" => stage)
+        .record(started.elapsed().as_secs_f64());
+}
+
 /// Encodes a batch of events into Arrow IPC streaming format
 pub fn encode_events_to_arrow_ipc_stream(
     events: &[Event],
@@ -217,13 +231,17 @@ pub fn encode_events_to_arrow_ipc_stream(
         return Err(ArrowEncodingError::NoEvents);
     }
 
+    let started = Instant::now();
+    let json_started = Instant::now();
     let json_values = vector_log_events_to_json_values(events).map_err(|e| {
         ArrowEncodingError::RecordBatchCreation {
             source: ArrowError::JsonError(e.to_string()),
         }
     })?;
+    record_arrow_record_batch_stage("event_to_json", json_started);
 
     let record_batch = build_record_batch(schema, &json_values)?;
+    record_arrow_record_batch_stage("total", started);
 
     let mut buffer = BytesMut::new().writer();
     let mut writer =
@@ -328,7 +346,9 @@ pub(crate) fn build_record_batch(
         return Err(ArrowEncodingError::NoEvents);
     }
 
+    let null_check_started = Instant::now();
     let missing = find_null_non_nullable_fields(&schema, values);
+    record_arrow_record_batch_stage("null_check", null_check_started);
     if !missing.is_empty() {
         let error: vector_common::Error = Box::new(ArrowEncodingError::NullConstraint {
             field_name: missing.join(", "),
@@ -341,6 +361,7 @@ pub(crate) fn build_record_batch(
         });
     }
 
+    let decoder_build_started = Instant::now();
     let mut decoder = ReaderBuilder::new(schema)
         .build_decoder()
         .inspect_err(|e| {
@@ -350,7 +371,9 @@ pub(crate) fn build_record_batch(
             });
         })
         .context(RecordBatchCreationSnafu)?;
+    record_arrow_record_batch_stage("decoder_build", decoder_build_started);
 
+    let decoder_serialize_started = Instant::now();
     decoder
         .serialize(values)
         .inspect_err(|e| {
@@ -360,8 +383,10 @@ pub(crate) fn build_record_batch(
             });
         })
         .context(ArrowJsonDecodeSnafu)?;
+    record_arrow_record_batch_stage("decoder_serialize", decoder_serialize_started);
 
-    decoder
+    let decoder_flush_started = Instant::now();
+    let record_batch = decoder
         .flush()
         .inspect_err(|e| {
             vector_common::internal_event::emit(crate::internal_events::EncoderRecordBatchError {
@@ -370,7 +395,10 @@ pub(crate) fn build_record_batch(
             });
         })
         .context(ArrowJsonDecodeSnafu)?
-        .ok_or(ArrowEncodingError::NoEvents)
+        .ok_or(ArrowEncodingError::NoEvents)?;
+    record_arrow_record_batch_stage("decoder_flush", decoder_flush_started);
+
+    Ok(record_batch)
 }
 
 #[cfg(test)]

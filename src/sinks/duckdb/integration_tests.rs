@@ -78,7 +78,7 @@ fn print_duckdb_file_sizes(path: &Path) {
     );
 }
 
-fn print_duckdb_stage_metrics() {
+fn print_stage_metrics(metric_name: &str, prefix: &str) {
     let Ok(controller) = Controller::get() else {
         return;
     };
@@ -87,7 +87,7 @@ fn print_duckdb_stage_metrics() {
         .capture_metrics()
         .into_iter()
         .filter_map(|metric| {
-            if metric.name() != "duckdb_request_stage_duration_seconds" {
+            if metric.name() != metric_name {
                 return None;
             }
 
@@ -105,11 +105,19 @@ fn print_duckdb_stage_metrics() {
     for (stage, count, sum) in stage_metrics {
         if count > 0 {
             println!(
-                "duckdb stage {stage}: count={count}, total={sum:.6}s, avg={:.6}s",
+                "{prefix} stage {stage}: count={count}, total={sum:.6}s, avg={:.6}s",
                 sum / count as f64
             );
         }
     }
+}
+
+fn print_duckdb_stage_metrics() {
+    print_stage_metrics("duckdb_request_stage_duration_seconds", "duckdb");
+}
+
+fn print_arrow_stage_metrics() {
+    print_stage_metrics("arrow_record_batch_stage_duration_seconds", "arrow");
 }
 
 fn prepare_config() -> (DuckdbConfig, String, String) {
@@ -558,6 +566,7 @@ async fn stress_million_events() {
         max_wal_size.load(Ordering::Relaxed)
     );
     print_duckdb_stage_metrics();
+    print_arrow_stage_metrics();
 }
 
 #[tokio::test]
