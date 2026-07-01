@@ -1,3 +1,5 @@
+use std::{env, time::Instant};
+
 use chrono::{TimeZone, Utc};
 use futures::{StreamExt, stream};
 use vector_lib::event::{BatchNotifier, BatchStatus, Event, LogEvent};
@@ -15,6 +17,21 @@ fn create_event(id: i32, message: &str) -> Event {
     let mut event = LogEvent::from(message);
     event.insert("id", id);
     event.insert("message", message);
+    event.into()
+}
+
+fn create_stress_event(id: i64) -> Event {
+    let mut event = LogEvent::default();
+    event.insert("id", id);
+    event.insert("message", format!("message-{id}"));
+    event.insert("host", format!("host-{}", id % 16));
+    event.insert(
+        "timestamp",
+        Utc.timestamp_micros(1_700_000_000_000_000 + id)
+            .single()
+            .unwrap(),
+    );
+    event.insert("value", id as f64 * 1.25);
     event.into()
 }
 
@@ -288,4 +305,151 @@ async fn writes_events() {
         )
         .expect("query row");
     assert_eq!(message, "two");
+}
+
+#[tokio::test]
+#[ignore]
+async fn stress_million_events() {
+    let event_count = env::var("DUCKDB_STRESS_EVENTS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1_000_000);
+    let batch_size = env::var("DUCKDB_STRESS_BATCH_EVENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+
+    let path = temp_file().with_extension("duckdb");
+    let endpoint = path.to_string_lossy().to_string();
+    let table = random_table_name();
+    let conn = duckdb::Connection::open(&path).expect("open duckdb database");
+    conn.execute(
+        &format!(
+            "CREATE TABLE {table} (\
+             id BIGINT NOT NULL, \
+             message VARCHAR, \
+             host VARCHAR, \
+             timestamp TIMESTAMP, \
+             value DOUBLE)"
+        ),
+        [],
+    )
+    .expect("create stress table");
+    drop(conn);
+
+    let config_str = format!(
+        r#"
+            endpoint = "{endpoint}"
+            table = "{table}"
+            batch.max_events = {batch_size}
+        "#,
+    );
+    let (config, _) = load_sink::<DuckdbConfig>(&config_str).unwrap();
+    let (sink, healthcheck) = config
+        .build(SinkContext::default())
+        .await
+        .expect("sink should build successfully");
+    healthcheck.await.expect("healthcheck should pass");
+
+    let (batch, receiver) = BatchNotifier::new_with_receiver();
+    let events = stream::iter(
+        (0..event_count).map(|id| create_stress_event(id).with_batch_notifier(&batch)),
+    );
+
+    let started = Instant::now();
+    sink.run(Box::pin(events.map(Into::into))).await.unwrap();
+    drop(batch);
+    assert_eq!(receiver.await, BatchStatus::Delivered);
+    let elapsed = started.elapsed();
+
+    let conn = duckdb::Connection::open(endpoint).expect("open duckdb database");
+    let (count, min_id, max_id, distinct_id, sum_id): (i64, i64, i64, i64, i128) = conn
+        .query_row(
+            &format!("SELECT count(*), min(id), max(id), count(DISTINCT id), sum(id) FROM {table}"),
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("query stress results");
+
+    assert_eq!(count, event_count);
+    assert_eq!(min_id, 0);
+    assert_eq!(max_id, event_count - 1);
+    assert_eq!(distinct_id, event_count);
+    assert_eq!(
+        sum_id,
+        (event_count as i128 * (event_count as i128 - 1)) / 2
+    );
+
+    let events_per_second = event_count as f64 / elapsed.as_secs_f64();
+    println!(
+        "inserted {event_count} events in {:.3}s ({events_per_second:.0} events/s), batch.max_events={batch_size}",
+        elapsed.as_secs_f64()
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn stress_failed_batch_is_atomic() {
+    let batch_size = 10_000;
+    let path = temp_file().with_extension("duckdb");
+    let endpoint = path.to_string_lossy().to_string();
+    let table = random_table_name();
+    let conn = duckdb::Connection::open(&path).expect("open duckdb database");
+    conn.execute(
+        &format!("CREATE TABLE {table} (id BIGINT NOT NULL, message VARCHAR)"),
+        [],
+    )
+    .expect("create atomicity table");
+    drop(conn);
+
+    let config_str = format!(
+        r#"
+            endpoint = "{endpoint}"
+            table = "{table}"
+            batch.max_events = {batch_size}
+        "#,
+    );
+    let (config, _) = load_sink::<DuckdbConfig>(&config_str).unwrap();
+    let (sink, healthcheck) = config
+        .build(SinkContext::default())
+        .await
+        .expect("sink should build successfully");
+    healthcheck.await.expect("healthcheck should pass");
+
+    let mut first_batch = (0..batch_size as i64)
+        .map(|id| create_event(id as i32, &format!("good-{id}")))
+        .collect::<Vec<_>>();
+    let first_receiver = BatchNotifier::apply_to(&mut first_batch);
+
+    let mut second_batch = (batch_size as i64..(batch_size * 2) as i64)
+        .map(|id| create_event(id as i32, &format!("bad-{id}")))
+        .collect::<Vec<_>>();
+    let mut missing_required = LogEvent::from("missing id");
+    missing_required.insert("message", "missing id");
+    second_batch[batch_size / 2] = missing_required.into();
+    let second_receiver = BatchNotifier::apply_to(&mut second_batch);
+
+    let events = first_batch.into_iter().chain(second_batch.into_iter());
+    sink.run(Box::pin(stream::iter(events).map(Into::into)))
+        .await
+        .unwrap();
+
+    assert_eq!(first_receiver.await, BatchStatus::Delivered);
+    assert_eq!(second_receiver.await, BatchStatus::Rejected);
+
+    let conn = duckdb::Connection::open(endpoint).expect("open duckdb database");
+    let count: i64 = conn
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count rows");
+    assert_eq!(count, batch_size as i64);
 }
