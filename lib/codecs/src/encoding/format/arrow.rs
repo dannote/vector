@@ -1061,6 +1061,156 @@ mod tests {
         }
     }
 
+    mod direct_record_batch {
+        use super::*;
+        use arrow::datatypes::{
+            Decimal128Type, Float64Type, Int32Type, Int64Type, TimestampMicrosecondType,
+        };
+        use chrono::TimeZone;
+
+        #[test]
+        fn direct_scalar_record_batch_matches_json_record_batch() {
+            let timestamp = Utc.with_ymd_and_hms(2026, 7, 1, 12, 34, 56).unwrap();
+            let mut log = LogEvent::default();
+            log.insert("int32", 42);
+            log.insert("int64", 9_000_000_000_i64);
+            log.insert("float64", 3.5);
+            log.insert("bool", true);
+            log.insert("string", "hello");
+            log.insert("timestamp", timestamp);
+            log.insert("decimal", 12.34);
+            let events = vec![Event::Log(log)];
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("int32", DataType::Int32, false),
+                Field::new("int64", DataType::Int64, false),
+                Field::new("float64", DataType::Float64, false),
+                Field::new("bool", DataType::Boolean, false),
+                Field::new("string", DataType::Utf8, false),
+                Field::new(
+                    "timestamp",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                Field::new("decimal", DataType::Decimal128(10, 2), false),
+            ]));
+
+            let serializer = ArrowStreamSerializer::new(ArrowStreamSerializerConfig::new(
+                schema.as_ref().clone(),
+            ))
+            .unwrap();
+            let direct_batch = serializer.encode_to_record_batch(&events).unwrap();
+
+            let json_values = vector_log_events_to_json_values(&events).unwrap();
+            let json_batch = build_record_batch(schema, &json_values).unwrap();
+
+            assert_eq!(direct_batch.num_rows(), json_batch.num_rows());
+            assert_eq!(
+                direct_batch.column(0).as_primitive::<Int32Type>().value(0),
+                json_batch.column(0).as_primitive::<Int32Type>().value(0)
+            );
+            assert_eq!(
+                direct_batch.column(1).as_primitive::<Int64Type>().value(0),
+                json_batch.column(1).as_primitive::<Int64Type>().value(0)
+            );
+            assert_eq!(
+                direct_batch
+                    .column(2)
+                    .as_primitive::<Float64Type>()
+                    .value(0),
+                json_batch.column(2).as_primitive::<Float64Type>().value(0)
+            );
+            assert_eq!(
+                direct_batch.column(3).as_boolean().value(0),
+                json_batch.column(3).as_boolean().value(0)
+            );
+            assert_eq!(
+                direct_batch.column(4).as_string::<i32>().value(0),
+                json_batch.column(4).as_string::<i32>().value(0)
+            );
+            assert_eq!(
+                direct_batch
+                    .column(5)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .value(0),
+                json_batch
+                    .column(5)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .value(0)
+            );
+            assert_eq!(
+                direct_batch
+                    .column(6)
+                    .as_primitive::<Decimal128Type>()
+                    .value(0),
+                json_batch
+                    .column(6)
+                    .as_primitive::<Decimal128Type>()
+                    .value(0)
+            );
+        }
+
+        #[test]
+        fn direct_record_batch_preserves_nullable_missing_values() {
+            let mut log = LogEvent::default();
+            log.insert("present", 42);
+            let events = vec![Event::Log(log)];
+
+            let schema = Schema::new(vec![
+                Field::new("present", DataType::Int64, false),
+                Field::new("missing", DataType::Utf8, true),
+            ]);
+            let serializer =
+                ArrowStreamSerializer::new(ArrowStreamSerializerConfig::new(schema)).unwrap();
+            let batch = serializer.encode_to_record_batch(&events).unwrap();
+
+            assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 42);
+            assert!(batch.column(1).is_null(0));
+        }
+
+        #[test]
+        fn direct_record_batch_rejects_missing_non_nullable_values() {
+            let events = vec![Event::Log(LogEvent::default())];
+            let schema = Schema::new(vec![Field::new("required", DataType::Int64, false)]);
+            let serializer =
+                ArrowStreamSerializer::new(ArrowStreamSerializerConfig::new(schema)).unwrap();
+
+            let error = serializer.encode_to_record_batch(&events).unwrap_err();
+            assert!(matches!(error, ArrowEncodingError::NullConstraint { .. }));
+        }
+
+        #[test]
+        fn encode_to_record_batch_falls_back_for_nested_schema() {
+            let event = create_event(vec![("items", Value::Array(vec![1.into(), 2.into()]))]);
+            let schema = Schema::new(vec![Field::new(
+                "items",
+                DataType::List(Field::new("item", DataType::Int64, true).into()),
+                true,
+            )]);
+            let serializer =
+                ArrowStreamSerializer::new(ArrowStreamSerializerConfig::new(schema)).unwrap();
+            let batch = serializer.encode_to_record_batch(&[event]).unwrap();
+
+            assert_eq!(batch.num_rows(), 1);
+            assert!(!batch.column(0).is_null(0));
+        }
+
+        #[test]
+        fn encode_to_record_batch_falls_back_for_parseable_timestamp_string() {
+            let event = create_event(vec![("ts", "2025-10-22T10:18:44.256Z")]);
+            let schema = Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                true,
+            )]);
+            let serializer =
+                ArrowStreamSerializer::new(ArrowStreamSerializerConfig::new(schema)).unwrap();
+            let batch = serializer.encode_to_record_batch(&[event]).unwrap();
+
+            assert!(!batch.column(0).is_null(0));
+        }
+    }
+
     mod config_tests {
         use super::*;
         use tokio_util::codec::Encoder;
